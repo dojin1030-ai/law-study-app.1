@@ -1,3 +1,15 @@
+import subprocess
+import sys
+
+# 서버 시작 시 openpyxl이 없으면 강제로 설치
+try:
+    import openpyxl
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl"])
+
+import streamlit as st
+import pandas as pd
+# ... (그 아래는 기존 코드와 동일)
 import streamlit as st
 import pandas as pd
 import random, json, os
