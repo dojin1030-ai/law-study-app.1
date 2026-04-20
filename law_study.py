@@ -68,7 +68,6 @@ if up:
         
         all_parts = sorted(df.iloc[:, 1].unique())
 
-        # 문제 전환 로직 (구조 보존)
         def pick_next(target_df):
             idx_l = target_df.index.tolist()
             if not idx_l: return False
@@ -78,9 +77,9 @@ if up:
             st.session_state.cur_iss = r.iloc[5]
             st.session_state.cur_ans = str(r.iloc[6])
             
+            # [수정] 핀 옆에 날짜 표시 제거
             pa = [str(r.iloc[i]) for i in [1, 2, 3, 4] if pd.notna(r.iloc[i]) and str(r.iloc[i]).lower() != 'nan']
-            dt_txt = f" | 🗓️ {r.iloc[10].strftime('%Y-%m-%d')}" if len(target_df.columns) >= 11 and pd.notna(r.iloc[10]) else ""
-            st.session_state.cur_pin = f"📍 {' > '.join(pa)}{dt_txt}"
+            st.session_state.cur_pin = f"📍 {' > '.join(pa)}"
             
             if st.session_state.cur_iss in st.session_state.rec: st.session_state.rec.remove(st.session_state.cur_iss)
             st.session_state.rec.append(st.session_state.cur_iss)
@@ -121,15 +120,16 @@ if up:
             if st.button("✅ 정답 확인"): st.session_state.ans_visible = True
             
             if st.session_state.ans_visible:
-                # [살려냄] 키워드 일치 개수 로직
-                u_words = set(u_i.split())
-                a_words = set(st.session_state.cur_ans.split())
-                match_count = len(u_words.intersection(a_words))
-                st.info(f"💡 키워드 일치 개수: {match_count}개")
-                
                 c1, c2 = st.columns(2)
                 with c1: st.warning("📝 나의 답변"); st.write(u_i if u_i else "내용 없음")
                 with c2: st.success("👨‍⚖️ 실제 판례"); st.write(st.session_state.cur_ans)
+                
+                # [수정] 키워드 일치 개수를 하단에 작게 회색으로 표시
+                u_words = set(u_i.split())
+                a_words = set(st.session_state.cur_ans.split())
+                match_count = len(u_words.intersection(a_words))
+                st.markdown(f"<p style='color:gray; font-size: 0.8em; margin-top: -10px;'>💡 키워드 일치: {match_count}개</p>", unsafe_allow_html=True)
+                
                 fb = st.text_input("보완할 점:", key=f"fb_{st.session_state.cur_iss}")
                 if st.button("💾 기록 저장"):
                     new_row = pd.DataFrame([{"date": datetime.now().strftime("%Y-%m-%d %H:%M"), "issue": st.session_state.cur_iss, "correct": st.session_state.cur_ans, "my_answer": u_i, "feedback": fb}])
@@ -155,7 +155,7 @@ if up:
                                     for _, row in recs.iloc[::-1].iterrows():
                                         with st.container():
                                             st.caption(f"📅 학습 일시: {row['date']}")
-                                            # [수정] 보완 사항을 상단에, 답변/정답을 하단 병렬로 배치
+                                            # [수정] 보완 사항을 상단에 배치
                                             st.warning(f"**보완 사항**: {row['feedback']}")
                                             r_low1, r_low2 = st.columns(2)
                                             r_low1.info(f"**나의 답변**\n\n{row['my_answer']}")
@@ -179,7 +179,6 @@ if up:
                                     st.caption(f"📍 {' > '.join(pin_info)}")
                                     st.write(f"**내용:** {r.iloc[6]}")
 
-        # TAB 4 & 5 (구조 절대 보존)
         with t4:
             st.header("📌 현재 체크 문제")
             for idx, r in df[df.iloc[:, 5].isin(st.session_state.chk)].iterrows():
@@ -188,13 +187,17 @@ if up:
                 st.caption(f"📍 {' > '.join(pin_info)}")
                 st.write(f"**판례:** {r.iloc[6]}")
                 st.divider()
+                
         with t5:
             st.header("🕒 누적 체크 기록")
             for is_nm, ct in st.session_state.evr.items():
                 with st.expander(f"🚩 {is_nm} ({ct}회)"):
-                    if is_nm in df[df.columns[5]].values:
-                        r_data = df[df.iloc[:, 5] == is_nm].iloc[0]
-                        st.write(r_data[6])
+                    # [수정] 인덱스 6(오류발생:6) 방어 로직 적용
+                    match_row = df[df.iloc[:, 5] == is_nm]
+                    if not match_row.empty:
+                        st.write(match_row.iloc[0, 6])
+                    else:
+                        st.write("삭제된 쟁점이거나 데이터를 찾을 수 없습니다.")
 
     except Exception as e: st.error(f"⚠️ 오류 발생: {e}")
 else: st.info("👈 사이드바에서 엑셀 파일을 업로드해 주세요!")
