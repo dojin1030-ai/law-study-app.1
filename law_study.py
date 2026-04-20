@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 # 페이지 설정
 st.set_page_config(page_title="법학암기 (Cloud Sync)", layout="wide")
-st.title("⚖️ 법학암기카드 (Power-Up Build)")
+st.title("⚖️ 법학암기카드 (Stable Build)")
 
 # 1. 구글 시트 연결
 try:
@@ -34,7 +34,7 @@ def save_to_gsheets(df, sheet_name):
         st.error(f"❌ '{sheet_name}' 저장 실패: {str(e)}")
         return False
 
-# 3. 세션 상태 초기화 (기존 구조 100% 유지)
+# 3. 세션 상태 초기화
 if 'init' not in st.session_state:
     h, c, e = load_gsheets_data()
     st.session_state.his = h if not h.empty else pd.DataFrame(columns=["date", "issue", "correct", "my_answer", "feedback"])
@@ -62,6 +62,10 @@ if up:
         df.iloc[:, 2] = df.iloc[:, 2].fillna('일반').astype(str).str.strip()
         df[df.columns[5]] = df[df.columns[5]].astype(str).str.strip()
         
+        # [K열 날짜 처리 필수] 인덱스 10이 K열입니다.
+        if len(df.columns) >= 11:
+            df[df.columns[10]] = pd.to_datetime(df[df.columns[10]], errors='coerce')
+        
         all_parts = sorted(df.iloc[:, 1].unique())
 
         def get_pin_text(r):
@@ -72,29 +76,15 @@ if up:
                 else: paths.append(f"({art})")
             return f"📍 {' > '.join(paths)}" if paths else "📍 미분류"
 
-        # [제안 2 반영] 망각곡선 기반 문제 추출 로직
         def pick_next(target_df):
             idx_l = target_df.index.tolist()
             if not idx_l: return False
-            
-            # 최근 5개 제외
-            pool = [i for i in idx_l if target_df.loc[i].iloc[5] not in st.session_state.rec]
-            if not pool: pool = idx_l
-            
-            # 스마트 추천 (오래된 순/평가 낮은 순) 가중치 부여
-            if not st.session_state.his.empty:
-                # 여기에 복잡한 가중치를 넣을 수 있지만, 우선 '학습 안 한지 오래된 것' 위주로 필터링
-                target_issues = target_df.loc[pool, target_df.columns[5]].tolist()
-                his_subset = st.session_state.his[st.session_state.his['issue'].isin(target_issues)]
-                # 학습 기록이 아예 없는 쟁점들을 최우선 순위로
-                never_studied = [i for i in pool if target_df.loc[i].iloc[5] not in st.session_state.his['issue'].values]
-                if never_studied: pool = never_studied
-            
-            sel_idx = random.choice(pool)
+            cd = [i for i in idx_l if target_df.loc[i].iloc[5] not in st.session_state.rec]
+            sel_idx = random.choice(cd if cd else idx_l)
             r = target_df.loc[sel_idx]
-            st.session_state.cur_iss, st.session_state.cur_ans = r.iloc[5], str(r.iloc[6])
+            st.session_state.cur_iss = r.iloc[5]
+            st.session_state.cur_ans = str(r.iloc[6])
             st.session_state.cur_pin = get_pin_text(r)
-            
             if st.session_state.cur_iss in st.session_state.rec: st.session_state.rec.remove(st.session_state.cur_iss)
             st.session_state.rec.append(st.session_state.cur_iss)
             if len(st.session_state.rec) > 5: st.session_state.rec.pop(0)
@@ -103,15 +93,26 @@ if up:
 
         with t1:
             st.sidebar.header("🎯 학습 설정")
-            # [제안 1 반영] 모바일 전용 플래시카드 모드 선택
             study_mode = st.sidebar.radio("학습 모드", ["타이핑 모드", "플래시카드(눈으로)"])
-            md = st.sidebar.radio("범위", ["전체", "✅ 체크만"], key="md_radio")
-            sc_parts = st.sidebar.multiselect("편 선택", all_parts, default=all_parts, key="sc_ms")
+            md = st.sidebar.radio("범위", ["전체", "✅ 체크만"])
+            
+            # [수정] K열(인덱스 10) 기준 날짜 필터링 로직 복구
+            dt_opt = st.sidebar.selectbox("기간 선택", ["전체 기간", "오늘 공부", "최근 3일", "최근 7일", "최근 1달"])
+            sc_parts = st.sidebar.multiselect("편 선택", all_parts, default=all_parts)
+            
+            fdf = df[df.iloc[:, 1].isin(sc_parts)]
+            
+            if len(df.columns) >= 11 and dt_opt != "전체 기간":
+                days_map = {"오늘 공부": 0, "최근 3일": 3, "최근 7일": 7, "최근 1달": 30}
+                today = datetime.now().date()
+                target_date = today - timedelta(days=days_map[dt_opt])
+                # K열(인덱스 10)의 날짜와 비교
+                fdf = fdf[fdf[df.columns[10]].dt.date >= target_date]
+
+            if md == "✅ 체크만": fdf = fdf[fdf.iloc[:, 5].isin(st.session_state.chk)]
             
             if st.button("🔄 다음 문제") or st.session_state.cur_iss == "":
-                fdf = df[df.iloc[:, 1].isin(sc_parts)]
-                if md == "✅ 체크만": fdf = fdf[fdf.iloc[:, 5].isin(st.session_state.chk)]
-                if not pick_next(fdf): st.info("문제가 없습니다.")
+                if not pick_next(fdf): st.info("해당 기간/범위에 맞는 문제가 없습니다.")
                 else: st.rerun()
 
             st.caption(st.session_state.cur_pin)
@@ -127,7 +128,6 @@ if up:
                         save_to_gsheets(pd.DataFrame(list(st.session_state.evr.items()), columns=['issue', 'count']), "EverChecked")
                     save_to_gsheets(pd.DataFrame(list(st.session_state.chk), columns=['issue']), "Checked"); st.rerun()
             
-            # 모드에 따른 입력창 분기
             u_i = ""
             if study_mode == "타이핑 모드":
                 u_i = st.text_area("워딩 입력:", height=150, key=f"ui_{st.session_state.cur_iss}")
@@ -141,13 +141,11 @@ if up:
                 with c1: st.warning("📝 나의 답변"); st.write(u_i if (study_mode == "타이핑 모드" and u_i) else "눈으로 복습 중")
                 with c2: st.success("👨‍⚖️ 실제 판례"); st.write(st.session_state.cur_ans)
                 
-                # 키워드 일치 (회색 소형 유지)
                 if study_mode == "타이핑 모드":
                     u_words = set(u_i.split()); a_words = set(st.session_state.cur_ans.split())
                     match_count = len(u_words.intersection(a_words))
                     st.markdown(f"<p style='color:gray; font-size: 0.8em; margin-top: -10px;'>💡 키워드 일치: {match_count}개</p>", unsafe_allow_html=True)
                 
-                # 자가 평가 및 피드백 저장
                 st.write("**스스로 평가하기**")
                 ev_cols = st.columns(4)
                 evaluation = ""
@@ -155,14 +153,14 @@ if up:
                 if ev_cols[1].button("🟡 보통"): evaluation = "보통"
                 if ev_cols[2].button("🔴 어려움"): evaluation = "어려움"
                 
-                fb = st.text_input("보완할 점(직접 입력):", key=f"fb_{st.session_state.cur_iss}")
-                
+                fb = st.text_input("보완할 점:", key=f"fb_{st.session_state.cur_iss}")
                 if st.button("💾 기록 저장") or evaluation:
                     final_fb = f"[{evaluation}] {fb}".strip() if evaluation else fb
                     new_row = pd.DataFrame([{"date": datetime.now().strftime("%Y-%m-%d %H:%M"), "issue": st.session_state.cur_iss, "correct": st.session_state.cur_ans, "my_answer": u_i if study_mode == "타이핑 모드" else "플래시카드", "feedback": final_fb}])
                     st.session_state.his = pd.concat([st.session_state.his, new_row], ignore_index=True)
                     if save_to_gsheets(st.session_state.his, "History"): st.success("✅ 저장 완료!"); st.rerun()
 
+        # 학습 리포트 (보완 상단 / 답변 정답 병렬 구조 엄격 유지)
         with t2:
             st.header("📊 학습 리포트")
             if st.button("🔄 리포트 새로고침"):
@@ -188,13 +186,13 @@ if up:
                                         for _, row in recs.iloc[::-1].iterrows():
                                             with st.container():
                                                 st.caption(f"📅 학습 일시: {row['date']}")
-                                                # [보완 사항 상단 유지]
                                                 st.warning(f"**보완 사항**: {row['feedback']}")
                                                 r_low1, r_low2 = st.columns(2)
                                                 r_low1.info(f"**나의 답변**\n\n{row['my_answer']}")
                                                 r_low2.success(f"**실제 정답**\n\n{row['correct']}")
                                                 st.divider()
 
+        # 전체 쟁점 정리
         with t3:
             st.header("📑 전체 쟁점 정리")
             sel_p3 = st.multiselect("1. 편 선택 (정리)", all_parts, key="p_total")
@@ -211,11 +209,11 @@ if up:
                                     st.caption(get_pin_text(r))
                                     st.write(f"**내용:** {r.iloc[6]}")
 
+        # 현재 체크 문제 (핀 작게 상단 유지)
         with t4:
             st.header("📌 현재 체크 문제")
             c_df = df[df.iloc[:, 5].isin(st.session_state.chk)]
             for _, r in c_df.iterrows():
-                # [핀 보통글씨 상단 배치 유지]
                 st.markdown(f"<span style='font-size:15px; color:gray;'>{get_pin_text(r)}</span>", unsafe_allow_html=True)
                 st.markdown(f"<h4 style='margin-top: 5px;'>❓ {r.iloc[5]}</h4>", unsafe_allow_html=True)
                 st.write(f"**판례:** {r.iloc[6]}"); st.divider()
