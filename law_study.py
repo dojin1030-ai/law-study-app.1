@@ -61,7 +61,6 @@ if up:
         df = df.dropna(subset=[df.columns[5], df.columns[6]])
         df.iloc[:, 1] = df.iloc[:, 1].fillna('미분류').astype(str).str.strip()
         df.iloc[:, 2] = df.iloc[:, 2].fillna('일반').astype(str).str.strip()
-        # [수정] 쟁점명은 건드리지 않고 원본 유지
         df[df.columns[5]] = df[df.columns[5]].astype(str).str.strip()
         
         if len(df.columns) >= 11:
@@ -69,7 +68,7 @@ if up:
         
         all_parts = sorted(df.iloc[:, 1].unique())
 
-        # 문제 전환 로직
+        # 문제 전환 로직 (구조 보존)
         def pick_next(target_df):
             idx_l = target_df.index.tolist()
             if not idx_l: return False
@@ -79,7 +78,6 @@ if up:
             st.session_state.cur_iss = r.iloc[5]
             st.session_state.cur_ans = str(r.iloc[6])
             
-            # [수정] 핀 정보에 조문(iloc[4]) 표시
             pa = [str(r.iloc[i]) for i in [1, 2, 3, 4] if pd.notna(r.iloc[i]) and str(r.iloc[i]).lower() != 'nan']
             dt_txt = f" | 🗓️ {r.iloc[10].strftime('%Y-%m-%d')}" if len(target_df.columns) >= 11 and pd.notna(r.iloc[10]) else ""
             st.session_state.cur_pin = f"📍 {' > '.join(pa)}{dt_txt}"
@@ -123,6 +121,12 @@ if up:
             if st.button("✅ 정답 확인"): st.session_state.ans_visible = True
             
             if st.session_state.ans_visible:
+                # [살려냄] 키워드 일치 개수 로직
+                u_words = set(u_i.split())
+                a_words = set(st.session_state.cur_ans.split())
+                match_count = len(u_words.intersection(a_words))
+                st.info(f"💡 키워드 일치 개수: {match_count}개")
+                
                 c1, c2 = st.columns(2)
                 with c1: st.warning("📝 나의 답변"); st.write(u_i if u_i else "내용 없음")
                 with c2: st.success("👨‍⚖️ 실제 판례"); st.write(st.session_state.cur_ans)
@@ -147,15 +151,15 @@ if up:
                                 iss = r.iloc[5]
                                 if iss in st.session_state.his['issue'].values:
                                     st.write(f"**📌 {iss}**")
-                                    # [수정] 내 답변, 정답, 피드백을 모두 보여주는 상세 리포트
                                     recs = st.session_state.his[st.session_state.his['issue'] == iss]
                                     for _, row in recs.iloc[::-1].iterrows():
                                         with st.container():
                                             st.caption(f"📅 학습 일시: {row['date']}")
-                                            r1, r2, r3 = st.columns(3)
-                                            r1.info(f"**나의 답변**\n\n{row['my_answer']}")
-                                            r2.success(f"**실제 정답**\n\n{row['correct']}")
-                                            r3.warning(f"**보완 사항**\n\n{row['feedback']}")
+                                            # [수정] 보완 사항을 상단에, 답변/정답을 하단 병렬로 배치
+                                            st.warning(f"**보완 사항**: {row['feedback']}")
+                                            r_low1, r_low2 = st.columns(2)
+                                            r_low1.info(f"**나의 답변**\n\n{row['my_answer']}")
+                                            r_low2.success(f"**실제 정답**\n\n{row['correct']}")
                                             st.divider()
 
         with t3:
@@ -170,28 +174,4 @@ if up:
                         for s in sorted(p_df.iloc[:, 2].unique()):
                             st.markdown(f"#### 📑 {s}")
                             for _, r in p_df[p_df.iloc[:, 2] == s].iterrows():
-                                # [수정] 조문 정보를 핀 형식으로 표시
-                                pin_info = [str(r.iloc[i]) for i in [1, 2, 3, 4] if pd.notna(r.iloc[i])]
-                                with st.expander(f"🔍 {r.iloc[5]}"):
-                                    st.caption(f"📍 {' > '.join(pin_info)}")
-                                    st.write(f"**내용:** {r.iloc[6]}")
-
-        # TAB 4 & 5
-        with t4:
-            st.header("📌 현재 체크 문제")
-            for idx, r in df[df.iloc[:, 5].isin(st.session_state.chk)].iterrows():
-                pin_info = [str(r.iloc[i]) for i in [1, 2, 3, 4] if pd.notna(r.iloc[i])]
-                st.markdown(f"#### ❓ {r.iloc[5]}")
-                st.caption(f"📍 {' > '.join(pin_info)}")
-                st.write(f"**판례:** {r.iloc[6]}")
-                st.divider()
-        with t5:
-            st.header("🕒 누적 체크 기록")
-            for is_nm, ct in st.session_state.evr.items():
-                with st.expander(f"🚩 {is_nm} ({ct}회)"):
-                    if is_nm in df[df.columns[5]].values:
-                        r_data = df[df.iloc[:, 5] == is_nm].iloc[0]
-                        st.write(r_data[6])
-
-    except Exception as e: st.error(f"⚠️ 오류 발생: {e}")
-else: st.info("👈 사이드바에서 엑셀 파일을 업로드해 주세요!")
+                                pin_info = [str(r.iloc[i]) for i in [1, 2, 3,
