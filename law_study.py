@@ -158,4 +158,50 @@ if up:
                                     # [수정] 과거 조문이 붙어 저장된 기록도 모두 찾아오도록 매칭 로직 강화
                                     mask = st.session_state.his['issue'].apply(lambda x: str(x) == iss or str(x).startswith(iss + "("))
                                     recs = st.session_state.his[mask]
-                                    if not rec
+                                    if not recs.empty:
+                                        st.write(f"**📌 {iss}**")
+                                        for _, row in recs.iloc[::-1].iterrows():
+                                            with st.container():
+                                                st.caption(f"📅 학습 일시: {row['date']}")
+                                                st.warning(f"**보완 사항**: {row['feedback']}")
+                                                r_low1, r_low2 = st.columns(2)
+                                                r_low1.info(f"**나의 답변**\n\n{row['my_answer']}")
+                                                r_low2.success(f"**실제 정답**\n\n{row['correct']}")
+                                                st.divider()
+
+        with t3:
+            st.header("📑 전체 쟁점 정리")
+            sel_p3 = st.multiselect("1. 편 선택 (정리)", all_parts, key="p_total")
+            if sel_p3:
+                rel_s3 = sorted(df[df.iloc[:, 1].isin(sel_p3)].iloc[:, 2].unique())
+                sel_s3 = st.multiselect("2. 절 선택 (정리)", rel_s3, default=rel_s3, key="s_total")
+                for p in sel_p3:
+                    with st.expander(f"📁 {p}", expanded=True):
+                        p_df = df[(df.iloc[:, 1] == p) & (df.iloc[:, 2].isin(sel_s3))]
+                        for s in sorted(p_df.iloc[:, 2].unique()):
+                            st.markdown(f"#### 📑 {s}")
+                            for _, r in p_df[p_df.iloc[:, 2] == s].iterrows():
+                                with st.expander(f"🔍 {r.iloc[5]}"):
+                                    st.caption(get_pin_text(r))
+                                    st.write(f"**내용:** {r.iloc[6]}")
+
+        with t4:
+            st.header("📌 현재 체크 문제")
+            c_df = df[df.iloc[:, 5].isin(st.session_state.chk)]
+            for _, r in c_df.iterrows():
+                # [수정] 핀을 보통글씨로, 물음표 상단에 배치
+                st.markdown(f"<span style='font-size:15px; color:gray;'>{get_pin_text(r)}</span>", unsafe_allow_html=True)
+                st.markdown(f"<h4 style='margin-top: 5px;'>❓ {r.iloc[5]}</h4>", unsafe_allow_html=True)
+                st.write(f"**판례:** {r.iloc[6]}")
+                st.divider()
+                
+        with t5:
+            st.header("🕒 누적 체크 기록")
+            for is_nm, ct in st.session_state.evr.items():
+                with st.expander(f"🚩 {is_nm} ({ct}회)"):
+                    match_row = df[df.iloc[:, 5] == is_nm]
+                    if not match_row.empty: st.write(match_row.iloc[0, 6])
+                    else: st.write("데이터를 찾을 수 없습니다.")
+
+    except Exception as e: st.error(f"⚠️ 오류 발생: {e}")
+else: st.info("👈 사이드바에서 엑셀 파일을 업로드해 주세요!")
