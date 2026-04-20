@@ -51,20 +51,29 @@ up = st.sidebar.file_uploader("엑셀 파일 업로드", type=["csv", "xlsx"])
 
 if up:
     try:
-        # 엑셀 로드 및 전처리 (채권총론 등 누락 방지를 위한 공백 제거)
+        # 데이터 로드
         if up.name.endswith('.csv'): df = pd.read_csv(up, header=1)
         else: df = pd.read_excel(up, header=1, engine='openpyxl')
+        
+        # [수정] 전처리: 필터 목록 생성 전에 '미분류'와 '조문' 처리
         df = df.dropna(subset=[df.columns[5], df.columns[6]])
-        df.iloc[:, 1] = df.iloc[:, 1].astype(str).str.strip().fillna("미분류") # '편'
-        df.iloc[:, 2] = df.iloc[:, 2].astype(str).str.strip().fillna("일반")  # '절'
-        df[df.columns[5]] = df[df.columns[5]].astype(str).str.strip() # '쟁점'
+        df.iloc[:, 1] = df.iloc[:, 1].astype(str).str.strip().replace(['nan', 'None', ''], '미분류') # '편' 빈칸 처리
+        df.iloc[:, 2] = df.iloc[:, 2].astype(str).str.strip().replace(['nan', 'None', ''], '일반')   # '절' 빈칸 처리
+        
+        # [수정] 쟁점명 뒤에 조문(406조 등) 붙이기 로직
+        def format_issue_name(row):
+            iss = str(row.iloc[5]).strip()
+            art = str(row.iloc[4]).strip() if pd.notna(row.iloc[4]) and str(row.iloc[4]).lower() != 'nan' else ""
+            return f"{iss}({art})" if art else iss
+
+        df[df.columns[5]] = df.apply(format_issue_name, axis=1) # 쟁점명 업데이트
         
         if len(df.columns) >= 11:
             df[df.columns[10]] = pd.to_datetime(df[df.columns[10]], errors='coerce')
         
         all_parts = sorted(df.iloc[:, 1].unique())
 
-        # --- TAB 1: 문제 풀기 (답변 칸 & 체크 버튼 복구) ---
+        # --- TAB 1: 문제 풀기 ---
         with t1:
             st.sidebar.header("🎯 학습 설정")
             md = st.sidebar.radio("범위", ["전체", "✅ 체크만"])
@@ -96,7 +105,6 @@ if up:
                 cq, cc = st.columns([5, 1])
                 with cq: st.markdown(f"### ❓ 쟁점: {st.session_state.cur_iss}")
                 with cc:
-                    # [복구] 체크 버튼
                     is_ch = st.session_state.cur_iss in st.session_state.chk
                     if st.button("❌ 해제" if is_ch else "📌 체크", key="chk_btn_main"):
                         if is_ch: st.session_state.chk.remove(st.session_state.cur_iss)
@@ -106,9 +114,7 @@ if up:
                             save_to_gsheets(pd.DataFrame(list(st.session_state.evr.items()), columns=['issue', 'count']), "EverChecked")
                         save_to_gsheets(pd.DataFrame(list(st.session_state.chk), columns=['issue']), "Checked"); st.rerun()
                 
-                # [복구] 답변 입력 칸
                 u_i = st.text_area("워딩 입력:", height=150, key=f"ui_{st.session_state.cur_iss}")
-                
                 if st.button("✅ 정답 확인"): st.session_state.ans_visible = True
                 if st.session_state.ans_visible:
                     c1, c2 = st.columns(2)
@@ -120,7 +126,7 @@ if up:
                         st.session_state.his = pd.concat([st.session_state.his, new_row], ignore_index=True)
                         save_to_gsheets(st.session_state.his, "History"); st.success("저장 완료!")
 
-        # --- TAB 2 & 3: 계층형 구조 (필터 로직 강화) ---
+        # --- TAB 2 & 3: 계층형 구조 ---
         for tab_obj, title, is_history in [(t2, "📊 학습 리포트", True), (t3, "📑 전체 쟁점 정리", False)]:
             with tab_obj:
                 st.header(title)
@@ -152,7 +158,7 @@ if up:
                                         with st.expander(f"🔍 {iss}"): st.write(f"**내용:** {r.iloc[6]}")
                                 st.write("")
 
-        # --- TAB 4 & 5: 기존 유지 ---
+        # --- TAB 4 & 5 ---
         with t4:
             st.header("📌 현재 체크 문제")
             for idx, r in df[df.iloc[:, 5].isin(st.session_state.chk)].iterrows():
