@@ -174,4 +174,27 @@ if up:
                         for s in sorted(p_df.iloc[:, 2].unique()):
                             st.markdown(f"#### 📑 {s}")
                             for _, r in p_df[p_df.iloc[:, 2] == s].iterrows():
-                                pin_info = [str(r.iloc[i]) for i in [1, 2, 3,
+                                pin_info = [str(r.iloc[i]) for i in [1, 2, 3, 4] if pd.notna(r.iloc[i])]
+                                with st.expander(f"🔍 {r.iloc[5]}"):
+                                    st.caption(f"📍 {' > '.join(pin_info)}")
+                                    st.write(f"**내용:** {r.iloc[6]}")
+
+        # TAB 4 & 5 (구조 절대 보존)
+        with t4:
+            st.header("📌 현재 체크 문제")
+            for idx, r in df[df.iloc[:, 5].isin(st.session_state.chk)].iterrows():
+                pin_info = [str(r.iloc[i]) for i in [1, 2, 3, 4] if pd.notna(r.iloc[i])]
+                st.markdown(f"#### ❓ {r.iloc[5]}")
+                st.caption(f"📍 {' > '.join(pin_info)}")
+                st.write(f"**판례:** {r.iloc[6]}")
+                st.divider()
+        with t5:
+            st.header("🕒 누적 체크 기록")
+            for is_nm, ct in st.session_state.evr.items():
+                with st.expander(f"🚩 {is_nm} ({ct}회)"):
+                    if is_nm in df[df.columns[5]].values:
+                        r_data = df[df.iloc[:, 5] == is_nm].iloc[0]
+                        st.write(r_data[6])
+
+    except Exception as e: st.error(f"⚠️ 오류 발생: {e}")
+else: st.info("👈 사이드바에서 엑셀 파일을 업로드해 주세요!")
