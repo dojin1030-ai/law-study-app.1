@@ -4,9 +4,9 @@ from streamlit_gsheets import GSheetsConnection
 import random, json, os
 from datetime import datetime, timedelta
 
-# 페이지 설정 (화이트/실버 톤 유지)
+# 페이지 설정
 st.set_page_config(page_title="법학암기 (Cloud Sync)", layout="wide")
-st.title("⚖️ 법학암기카드")
+st.title("⚖️ 법학암기카드 (Google Sheets Sync)")
 
 # 1. 구글 시트 연결
 try:
@@ -15,7 +15,7 @@ except Exception as e:
     st.error(f"❌ 구글 시트 연결 설정 확인 필요: {e}")
     st.stop()
 
-# 2. 데이터 로드 함수
+# 2. 데이터 로드 및 저장 함수
 def load_gsheets_data():
     h_df, c_df, e_df = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     try: h_df = conn.read(worksheet="History", ttl="0")
@@ -51,19 +51,20 @@ up = st.sidebar.file_uploader("엑셀 파일 업로드", type=["csv", "xlsx"])
 
 if up:
     try:
+        # 엑셀 로드 및 전처리 (채권총론 등 누락 방지를 위한 공백 제거)
         if up.name.endswith('.csv'): df = pd.read_csv(up, header=1)
         else: df = pd.read_excel(up, header=1, engine='openpyxl')
         df = df.dropna(subset=[df.columns[5], df.columns[6]])
-        df[df.columns[5]] = df[df.columns[5]].astype(str).str.strip()
-        df.iloc[:, 1] = df.iloc[:, 1].fillna("미분류")
-        df.iloc[:, 2] = df.iloc[:, 2].fillna("일반") # '절'이 비었을 경우 대비
+        df.iloc[:, 1] = df.iloc[:, 1].astype(str).str.strip().fillna("미분류") # '편'
+        df.iloc[:, 2] = df.iloc[:, 2].astype(str).str.strip().fillna("일반")  # '절'
+        df[df.columns[5]] = df[df.columns[5]].astype(str).str.strip() # '쟁점'
         
         if len(df.columns) >= 11:
             df[df.columns[10]] = pd.to_datetime(df[df.columns[10]], errors='coerce')
         
         all_parts = sorted(df.iloc[:, 1].unique())
 
-        # --- TAB 1: 문제 풀기 (기존 유지) ---
+        # --- TAB 1: 문제 풀기 (답변 칸 & 체크 버튼 복구) ---
         with t1:
             st.sidebar.header("🎯 학습 설정")
             md = st.sidebar.radio("범위", ["전체", "✅ 체크만"])
@@ -92,44 +93,51 @@ if up:
                     st.session_state.rec.append(st.session_state.cur_iss); st.session_state.ans_visible = False; st.rerun()
 
                 st.caption(st.session_state.cur_pin)
-                st.markdown(f"### ❓ 쟁점: {st.session_state.cur_iss}")
+                cq, cc = st.columns([5, 1])
+                with cq: st.markdown(f"### ❓ 쟁점: {st.session_state.cur_iss}")
+                with cc:
+                    # [복구] 체크 버튼
+                    is_ch = st.session_state.cur_iss in st.session_state.chk
+                    if st.button("❌ 해제" if is_ch else "📌 체크", key="chk_btn_main"):
+                        if is_ch: st.session_state.chk.remove(st.session_state.cur_iss)
+                        else:
+                            st.session_state.chk.add(st.session_state.cur_iss)
+                            st.session_state.evr[st.session_state.cur_iss] = st.session_state.evr.get(st.session_state.cur_iss, 0) + 1
+                            save_to_gsheets(pd.DataFrame(list(st.session_state.evr.items()), columns=['issue', 'count']), "EverChecked")
+                        save_to_gsheets(pd.DataFrame(list(st.session_state.chk), columns=['issue']), "Checked"); st.rerun()
+                
+                # [복구] 답변 입력 칸
+                u_i = st.text_area("워딩 입력:", height=150, key=f"ui_{st.session_state.cur_iss}")
+                
                 if st.button("✅ 정답 확인"): st.session_state.ans_visible = True
                 if st.session_state.ans_visible:
-                    st.success(f"👨‍⚖️ 실제 판례: {st.session_state.cur_ans}")
-                    fb = st.text_input("보완할 점:")
+                    c1, c2 = st.columns(2)
+                    with c1: st.warning("📝 나의 답변"); st.write(u_i if u_i else "없음")
+                    with c2: st.success("👨‍⚖️ 실제 판례"); st.write(st.session_state.cur_ans)
+                    fb = st.text_input("보완할 점:", key=f"fb_{st.session_state.cur_iss}")
                     if st.button("💾 기록 저장"):
-                        new_row = pd.DataFrame([{"date": datetime.now().strftime("%Y-%m-%d %H:%M"), "issue": st.session_state.cur_iss, "correct": st.session_state.cur_ans, "my_answer": "", "feedback": fb}])
+                        new_row = pd.DataFrame([{"date": datetime.now().strftime("%Y-%m-%d %H:%M"), "issue": st.session_state.cur_iss, "correct": st.session_state.cur_ans, "my_answer": u_i, "feedback": fb}])
                         st.session_state.his = pd.concat([st.session_state.his, new_row], ignore_index=True)
                         save_to_gsheets(st.session_state.his, "History"); st.success("저장 완료!")
 
-        # --- TAB 2 & 3: 계층형 필터 및 마인드맵식 뷰 ---
+        # --- TAB 2 & 3: 계층형 구조 (필터 로직 강화) ---
         for tab_obj, title, is_history in [(t2, "📊 학습 리포트", True), (t3, "📑 전체 쟁점 정리", False)]:
             with tab_obj:
                 st.header(title)
-                # 1단계: 편 선택
-                sel_p = st.multiselect(f"1. 편 선택 ({title})", all_parts, key=f"p_{title}")
-                
+                sel_p = st.multiselect(f"1. 편 선택 ({title})", all_parts, key=f"p_sel_{title}")
                 if sel_p:
-                    # 2단계: 선택된 편에 속한 '절'들만 필터링
-                    relevant_sects = sorted(df[df.iloc[:, 1].isin(sel_p)].iloc[:, 2].unique())
-                    sel_s = st.multiselect(f"2. 절 선택 ({title})", relevant_sects, default=relevant_sects, key=f"s_{title}")
-                    
+                    rel_sects = sorted(df[df.iloc[:, 1].isin(sel_p)].iloc[:, 2].unique())
+                    sel_s = st.multiselect(f"2. 절 선택 ({title})", rel_sects, default=rel_sects, key=f"s_sel_{title}")
                     st.divider()
-                    
-                    # 마인드맵 구조 (편 -> 절 -> 쟁점)
                     for p in sel_p:
                         with st.expander(f"📁 {p}", expanded=True):
                             p_df = df[(df.iloc[:, 1] == p) & (df.iloc[:, 2].isin(sel_s))]
-                            sections_in_p = sorted(p_df.iloc[:, 2].unique())
-                            
-                            for s in sections_in_p:
+                            for s in sorted(p_df.iloc[:, 2].unique()):
                                 st.markdown(f"#### 📑 {s}")
                                 s_df = p_df[p_df.iloc[:, 2] == s]
-                                
                                 for _, r in s_df.iterrows():
                                     iss = r.iloc[5]
                                     if is_history:
-                                        # 학습 리포트용 (기록이 있는 것만 표시)
                                         if iss in st.session_state.his['issue'].values:
                                             with st.container():
                                                 c_t, c_d = st.columns([10, 1])
@@ -141,12 +149,10 @@ if up:
                                                 for _, row in recs.iloc[::-1].iterrows():
                                                     st.caption(f"📅 {row['date']} | 보완: {row['feedback']}")
                                     else:
-                                        # 전체 쟁점 정리용
-                                        with st.expander(f"🔍 {iss}"):
-                                            st.write(f"**내용:** {r.iloc[6]}")
-                                st.write("") # 간격 조절
+                                        with st.expander(f"🔍 {iss}"): st.write(f"**내용:** {r.iloc[6]}")
+                                st.write("")
 
-        # --- TAB 4 & 5 (기존 유지) ---
+        # --- TAB 4 & 5: 기존 유지 ---
         with t4:
             st.header("📌 현재 체크 문제")
             for idx, r in df[df.iloc[:, 5].isin(st.session_state.chk)].iterrows():
@@ -158,5 +164,5 @@ if up:
                 with st.expander(f"🚩 {is_nm} ({ct}회)"):
                     st.write(df[df.iloc[:, 5] == is_nm].iloc[0, 6])
 
-    except Exception as e: st.error(f"⚠️ 오류: {e}")
+    except Exception as e: st.error(f"⚠️ 오류 발생: {e}")
 else: st.info("👈 사이드바에서 엑셀 파일을 업로드해 주세요!")
