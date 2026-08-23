@@ -1,229 +1,296 @@
-import streamlit as st
-import pandas as pd
-from streamlit_gsheets import GSheetsConnection
-import random, json, os
+import hashlib
+import random
 from datetime import datetime, timedelta
 
-# 페이지 설정
+import pandas as pd
+import streamlit as st 
+from streamlit_gsheets import GSheetsConnection
+
+
 st.set_page_config(page_title="법학암기 (Cloud Sync)", layout="wide")
 st.title("⚖️ 법학암기카드 (Stable Build)")
 
-# 1. 구글 시트 연결
-try:
-    conn = st.connection("gsheets", type=GSheetsConnection)
-except Exception as e:
-    st.error(f"❌ 구글 시트 연결 설정 확인 필요: {e}")
-    st.stop()
+REQUIRED_COLUMN_COUNT = 7
+HISTORY_COLUMNS = ["date", "card_id", "issue", "correct", "my_answer", "feedback", "evaluation"]
 
-# 2. 데이터 로드 및 저장 함수
-def load_gsheets_data():
-    h_df, c_df, e_df = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    try: h_df = conn.read(worksheet="History", ttl=0)
-    except: pass
-    try: c_df = conn.read(worksheet="Checked", ttl=0)
-    except: pass
-    try: e_df = conn.read(worksheet="EverChecked", ttl=0)
-    except: pass
-    return h_df, c_df, e_df
 
-def save_to_gsheets(df, sheet_name):
+@st.cache_resource
+def get_connection():
+    return st.connection("gsheets", type=GSheetsConnection)
+
+
+def empty_history():
+    return pd.DataFrame(columns=HISTORY_COLUMNS)
+
+
+def read_sheet(worksheet, columns):
+    """빈 워크시트만 빈 DataFrame으로 처리하고, 연결 오류는 사용자에게 알린다."""
     try:
-        conn.update(worksheet=sheet_name, data=df)
+        data = get_connection().read(worksheet=worksheet, ttl=0)
+        return data if not data.empty else pd.DataFrame(columns=columns)
+    except Exception as exc:
+        st.warning(f"'{worksheet}' 시트를 읽지 못했습니다: {exc}")
+        return pd.DataFrame(columns=columns)
+
+
+def update_sheet(data, worksheet):
+    try:
+        get_connection().update(worksheet=worksheet, data=data)
         return True
-    except Exception as e:
-        st.error(f"❌ '{sheet_name}' 저장 실패: {str(e)}")
+    except Exception as exc:
+        st.error(f"❌ '{worksheet}' 저장 실패: {exc}")
         return False
 
-# 3. 세션 상태 초기화
-if 'init' not in st.session_state:
-    h, c, e = load_gsheets_data()
-    st.session_state.his = h if not h.empty else pd.DataFrame(columns=["date", "issue", "correct", "my_answer", "feedback"])
-    st.session_state.chk = set(c['issue'].tolist()) if (not c.empty and 'issue' in c.columns) else set()
-    st.session_state.evr = e.set_index('issue')['count'].to_dict() if (not e.empty and 'issue' in e.columns) else {}
-    st.session_state.init = True
 
-if 'cur_iss' not in st.session_state: st.session_state.cur_iss = ""
-if 'cur_ans' not in st.session_state: st.session_state.cur_ans = ""
-if 'cur_pin' not in st.session_state: st.session_state.cur_pin = ""
-if 'ans_visible' not in st.session_state: st.session_state.ans_visible = False
-if 'rec' not in st.session_state: st.session_state.rec = []
+def card_id(row):
+    """동일 쟁점명이 다른 편/절에 있을 때도 구분되는 안정적인 내부 식별자."""
+    values = [str(row.iloc[index]).strip() if index < len(row) and pd.notna(row.iloc[index]) else "" for index in (1, 2, 3, 4, 5)]
+    return hashlib.sha256("\x1f".join(values).encode()).hexdigest()[:16]
 
-# 4. 메인 UI
+
+def pin_text(row):
+    paths = [str(row.iloc[i]).strip() for i in (1, 2, 3) if pd.notna(row.iloc[i]) and str(row.iloc[i]).strip().lower() != "nan" and str(row.iloc[i]).strip()]
+    article = str(row.iloc[4]).strip() if pd.notna(row.iloc[4]) and str(row.iloc[4]).strip().lower() != "nan" else ""
+    if article:
+        paths[-1:] = [f"{paths[-1]}({article})"] if paths else [f"({article})"]
+    return f"📍 {' > '.join(paths)}" if paths else "📍 미분류"
+
+
+def prepare_cards(uploaded_file):
+    if uploaded_file.name.lower().endswith(".csv"):
+        cards = pd.read_csv(uploaded_file, header=1)
+    else:
+        cards = pd.read_excel(uploaded_file, header=1, engine="openpyxl")
+    if len(cards.columns) < REQUIRED_COLUMN_COUNT:
+        raise ValueError("업로드 파일에는 최소 7개 열이 필요합니다. (F열: 쟁점, G열: 판례 내용)")
+
+    cards = cards.dropna(subset=[cards.columns[5], cards.columns[6]]).copy()
+    if cards.empty:
+        raise ValueError("F열과 G열에 모두 값이 있는 문제가 없습니다.")
+    for index, default in ((1, "미분류"), (2, "일반"), (5, "")):
+        cards.iloc[:, index] = cards.iloc[:, index].fillna(default).astype(str).str.strip()
+    cards.iloc[:, 6] = cards.iloc[:, 6].fillna("").astype(str).str.strip()
+    if len(cards.columns) >= 11:
+        cards.iloc[:, 10] = pd.to_datetime(cards.iloc[:, 10], errors="coerce")
+    cards["_card_id"] = cards.apply(card_id, axis=1)
+    return cards
+
+
+def is_checked(card):
+    # issue만 저장한 기존 Checked 시트와 card_id를 저장한 새 형식을 모두 지원한다.
+    return card["_card_id"] in st.session_state.checked_ids or card.iloc[5] in st.session_state.checked_legacy_issues
+
+
+def save_checked_state():
+    cards = st.session_state.cards
+    selected = cards[cards.apply(is_checked, axis=1)][["_card_id", cards.columns[5]]].copy()
+    selected.columns = ["card_id", "issue"]
+    return update_sheet(selected.drop_duplicates(), "Checked")
+
+
+def append_history(record):
+    # 기록 버튼을 누를 때 최신 History를 다시 읽어 다른 세션의 기존 기록을 보존한다.
+    latest = read_sheet("History", HISTORY_COLUMNS)
+    for column in HISTORY_COLUMNS:
+        if column not in latest.columns:
+            latest[column] = ""
+    return update_sheet(pd.concat([latest[HISTORY_COLUMNS], pd.DataFrame([record])], ignore_index=True), "History")
+
+
+def as_count(value):
+    number = pd.to_numeric(value, errors="coerce")
+    return int(number) if pd.notna(number) else 0
+
+
+def choose_next(cards):
+    if cards.empty:
+        return False
+    candidates = cards[~cards["_card_id"].isin(st.session_state.recent_ids)]
+    card = candidates.sample(n=1) if not candidates.empty else cards.sample(n=1)
+    selected = card.iloc[0]
+    st.session_state.current_id = selected["_card_id"]
+    st.session_state.answer_visible = False
+    st.session_state.recent_ids = (st.session_state.recent_ids + [selected["_card_id"]])[-5:]
+    return True
+
+
+if "initialized" not in st.session_state:
+    history = read_sheet("History", HISTORY_COLUMNS)
+    checked = read_sheet("Checked", ["card_id", "issue"])
+    ever_checked = read_sheet("EverChecked", ["card_id", "issue", "count"])
+    st.session_state.history = history if not history.empty else empty_history()
+    st.session_state.checked_ids = set(checked.get("card_id", pd.Series(dtype=str)).dropna().astype(str))
+    st.session_state.checked_legacy_issues = set(checked.get("issue", pd.Series(dtype=str)).dropna().astype(str))
+    st.session_state.ever_checked = {
+        str(row.get("card_id") or row.get("issue")): as_count(row.get("count"))
+        for _, row in ever_checked.iterrows()
+    }
+    st.session_state.recent_ids = []
+    st.session_state.current_id = None
+    st.session_state.answer_visible = False
+    st.session_state.initialized = True
+
+
+uploaded = st.sidebar.file_uploader("엑셀 파일 업로드", type=["csv", "xlsx"])
+if not uploaded:
+    st.info("👈 사이드바에서 엑셀 파일을 업로드해 주세요!")
+    st.stop()
+
+try:
+    st.session_state.cards = prepare_cards(uploaded)
+except Exception as exc:
+    st.error(f"⚠️ 업로드 파일을 처리할 수 없습니다: {exc}")
+    st.stop()
+
+cards = st.session_state.cards
+parts = sorted(cards.iloc[:, 1].dropna().unique())
 t1, t2, t3, t4, t5 = st.tabs(["📖 문제 풀기", "📊 학습 리포트", "📑 전체 쟁점 정리", "📌 현재 체크 문제", "🕒 누적 체크 기록"])
-up = st.sidebar.file_uploader("엑셀 파일 업로드", type=["csv", "xlsx"])
 
-if up:
-    try:
-        if up.name.endswith('.csv'): df = pd.read_csv(up, header=1)
-        else: df = pd.read_excel(up, header=1, engine='openpyxl')
-        
-        df = df.dropna(subset=[df.columns[5], df.columns[6]])
-        df.iloc[:, 1] = df.iloc[:, 1].fillna('미분류').astype(str).str.strip()
-        df.iloc[:, 2] = df.iloc[:, 2].fillna('일반').astype(str).str.strip()
-        df[df.columns[5]] = df[df.columns[5]].astype(str).str.strip()
-        
-        # [K열 날짜 처리 필수] 인덱스 10이 K열입니다.
-        if len(df.columns) >= 11:
-            df[df.columns[10]] = pd.to_datetime(df[df.columns[10]], errors='coerce')
-        
-        all_parts = sorted(df.iloc[:, 1].unique())
+with t1:
+    st.sidebar.header("🎯 학습 설정")
+    study_mode = st.sidebar.radio("학습 모드", ["타이핑 모드", "플래시카드(눈으로)"])
+    scope = st.sidebar.radio("범위", ["전체", "✅ 체크만"])
+    period = st.sidebar.selectbox("기간 선택", ["전체 기간", "오늘 공부", "최근 3일", "최근 7일", "최근 1달"])
+    selected_parts = st.sidebar.multiselect("편 선택", parts, default=parts)
 
-        def get_pin_text(r):
-            paths = [str(r.iloc[i]).strip() for i in [1, 2, 3] if pd.notna(r.iloc[i]) and str(r.iloc[i]).strip().lower() != 'nan' and str(r.iloc[i]).strip() != '']
-            art = str(r.iloc[4]).strip() if pd.notna(r.iloc[4]) and str(r.iloc[4]).strip().lower() != 'nan' else ""
-            if art:
-                if paths: paths[-1] = f"{paths[-1]}({art})"
-                else: paths.append(f"({art})")
-            return f"📍 {' > '.join(paths)}" if paths else "📍 미분류"
+    filtered = cards[cards.iloc[:, 1].isin(selected_parts)].copy()
+    if period != "전체 기간":
+        if len(cards.columns) < 12:  # _card_id가 추가되어 원본 11열은 총 12열
+            st.sidebar.warning("기간 필터를 사용하려면 원본 K열에 날짜가 필요합니다.")
+        else:
+            days = {"오늘 공부": 0, "최근 3일": 2, "최근 7일": 6, "최근 1달": 29}[period]
+            cutoff = pd.Timestamp(datetime.now().date() - timedelta(days=days))
+            filtered = filtered[filtered.iloc[:, 10].notna() & (filtered.iloc[:, 10] >= cutoff)]
+    if scope == "✅ 체크만":
+        filtered = filtered[filtered.apply(is_checked, axis=1)]
 
-        def pick_next(target_df):
-            idx_l = target_df.index.tolist()
-            if not idx_l: return False
-            cd = [i for i in idx_l if target_df.loc[i].iloc[5] not in st.session_state.rec]
-            sel_idx = random.choice(cd if cd else idx_l)
-            r = target_df.loc[sel_idx]
-            st.session_state.cur_iss = r.iloc[5]
-            st.session_state.cur_ans = str(r.iloc[6])
-            st.session_state.cur_pin = get_pin_text(r)
-            if st.session_state.cur_iss in st.session_state.rec: st.session_state.rec.remove(st.session_state.cur_iss)
-            st.session_state.rec.append(st.session_state.cur_iss)
-            if len(st.session_state.rec) > 5: st.session_state.rec.pop(0)
-            st.session_state.ans_visible = False
-            return True
+    if st.button("🔄 다음 문제") or st.session_state.current_id is None:
+        if not choose_next(filtered):
+            st.info("해당 기간/범위에 맞는 문제가 없습니다.")
+            st.stop()
+        st.rerun()
 
-        with t1:
-            st.sidebar.header("🎯 학습 설정")
-            study_mode = st.sidebar.radio("학습 모드", ["타이핑 모드", "플래시카드(눈으로)"])
-            md = st.sidebar.radio("범위", ["전체", "✅ 체크만"])
-            
-            # [수정] K열(인덱스 10) 기준 날짜 필터링 로직 복구
-            dt_opt = st.sidebar.selectbox("기간 선택", ["전체 기간", "오늘 공부", "최근 3일", "최근 7일", "최근 1달"])
-            sc_parts = st.sidebar.multiselect("편 선택", all_parts, default=all_parts)
-            
-            fdf = df[df.iloc[:, 1].isin(sc_parts)]
-            
-            if len(df.columns) >= 11 and dt_opt != "전체 기간":
-                days_map = {"오늘 공부": 0, "최근 3일": 3, "최근 7일": 7, "최근 1달": 30}
-                today = datetime.now().date()
-                target_date = today - timedelta(days=days_map[dt_opt])
-                # K열(인덱스 10)의 날짜와 비교
-                fdf = fdf[fdf[df.columns[10]].dt.date >= target_date]
-
-            if md == "✅ 체크만": fdf = fdf[fdf.iloc[:, 5].isin(st.session_state.chk)]
-            
-            if st.button("🔄 다음 문제") or st.session_state.cur_iss == "":
-                if not pick_next(fdf): st.info("해당 기간/범위에 맞는 문제가 없습니다.")
-                else: st.rerun()
-
-            st.caption(st.session_state.cur_pin)
-            cq, cc = st.columns([5, 1])
-            with cq: st.markdown(f"### ❓ 쟁점: {st.session_state.cur_iss}")
-            with cc:
-                is_ch = st.session_state.cur_iss in st.session_state.chk
-                if st.button("❌ 해제" if is_ch else "📌 체크", key="main_chk"):
-                    if is_ch: st.session_state.chk.remove(st.session_state.cur_iss)
-                    else:
-                        st.session_state.chk.add(st.session_state.cur_iss)
-                        st.session_state.evr[st.session_state.cur_iss] = st.session_state.evr.get(st.session_state.cur_iss, 0) + 1
-                        save_to_gsheets(pd.DataFrame(list(st.session_state.evr.items()), columns=['issue', 'count']), "EverChecked")
-                    save_to_gsheets(pd.DataFrame(list(st.session_state.chk), columns=['issue']), "Checked"); st.rerun()
-            
-            u_i = ""
-            if study_mode == "타이핑 모드":
-                u_i = st.text_area("워딩 입력:", height=150, key=f"ui_{st.session_state.cur_iss}")
+    current_rows = cards[cards["_card_id"] == st.session_state.current_id]
+    if current_rows.empty:
+        st.warning("현재 문제를 찾을 수 없습니다. 새 문제를 선택해 주세요.")
+        st.session_state.current_id = None
+        st.rerun()
+    current = current_rows.iloc[0]
+    st.caption(pin_text(current))
+    left, right = st.columns([5, 1])
+    with left:
+        st.markdown(f"### ❓ 쟁점: {current.iloc[5]}")
+    with right:
+        checked_now = is_checked(current)
+        if st.button("❌ 해제" if checked_now else "📌 체크"):
+            if checked_now:
+                st.session_state.checked_ids.discard(current["_card_id"])
+                st.session_state.checked_legacy_issues.discard(current.iloc[5])
             else:
-                st.info("💡 눈으로 판례를 떠올린 후 아래 [정답 확인]을 눌러주세요.")
+                st.session_state.checked_ids.add(current["_card_id"])
+                st.session_state.ever_checked[current["_card_id"]] = st.session_state.ever_checked.get(current["_card_id"], 0) + 1
+                ever = pd.DataFrame([
+                    {"card_id": key, "issue": cards.loc[cards["_card_id"] == key].iloc[0, 5] if not cards.loc[cards["_card_id"] == key].empty else key, "count": count}
+                    for key, count in st.session_state.ever_checked.items()
+                ])
+                if not update_sheet(ever, "EverChecked"):
+                    st.stop()
+            if save_checked_state():
+                st.rerun()
 
-            if st.button("✅ 정답 확인"): st.session_state.ans_visible = True
-            
-            if st.session_state.ans_visible:
-                c1, c2 = st.columns(2)
-                with c1: st.warning("📝 나의 답변"); st.write(u_i if (study_mode == "타이핑 모드" and u_i) else "눈으로 복습 중")
-                with c2: st.success("👨‍⚖️ 실제 판례"); st.write(st.session_state.cur_ans)
-                
-                if study_mode == "타이핑 모드":
-                    u_words = set(u_i.split()); a_words = set(st.session_state.cur_ans.split())
-                    match_count = len(u_words.intersection(a_words))
-                    st.markdown(f"<p style='color:gray; font-size: 0.8em; margin-top: -10px;'>💡 키워드 일치: {match_count}개</p>", unsafe_allow_html=True)
-                
-                st.write("**스스로 평가하기**")
-                ev_cols = st.columns(4)
-                evaluation = ""
-                if ev_cols[0].button("🟢 쉬움"): evaluation = "쉬움"
-                if ev_cols[1].button("🟡 보통"): evaluation = "보통"
-                if ev_cols[2].button("🔴 어려움"): evaluation = "어려움"
-                
-                fb = st.text_input("보완할 점:", key=f"fb_{st.session_state.cur_iss}")
-                if st.button("💾 기록 저장") or evaluation:
-                    final_fb = f"[{evaluation}] {fb}".strip() if evaluation else fb
-                    new_row = pd.DataFrame([{"date": datetime.now().strftime("%Y-%m-%d %H:%M"), "issue": st.session_state.cur_iss, "correct": st.session_state.cur_ans, "my_answer": u_i if study_mode == "타이핑 모드" else "플래시카드", "feedback": final_fb}])
-                    st.session_state.his = pd.concat([st.session_state.his, new_row], ignore_index=True)
-                    if save_to_gsheets(st.session_state.his, "History"): st.success("✅ 저장 완료!"); st.rerun()
+    typed_answer = ""
+    if study_mode == "타이핑 모드":
+        typed_answer = st.text_area("워딩 입력:", height=150, key=f"answer_{current['_card_id']}")
+    else:
+        st.info("💡 눈으로 판례를 떠올린 후 아래 [정답 확인]을 눌러주세요.")
+    if st.button("✅ 정답 확인"):
+        st.session_state.answer_visible = True
 
-        # 학습 리포트 (보완 상단 / 답변 정답 병렬 구조 엄격 유지)
-        with t2:
-            st.header("📊 학습 리포트")
-            if st.button("🔄 리포트 새로고침"):
-                h, c, e = load_gsheets_data()
-                st.session_state.his = h; st.rerun()
+    if st.session_state.answer_visible:
+        answer_col, model_col = st.columns(2)
+        answer_col.warning("📝 나의 답변")
+        answer_col.write(typed_answer if typed_answer else "눈으로 복습 중")
+        model_col.success("👨‍⚖️ 실제 판례")
+        model_col.write(current.iloc[6])
+        if study_mode == "타이핑 모드":
+            matched = len(set(typed_answer.split()) & set(str(current.iloc[6]).split()))
+            st.caption(f"💡 키워드 일치: {matched}개")
 
-            sel_p2 = st.multiselect("1. 편 선택 (리포트)", all_parts, key="p_rep")
-            if sel_p2:
-                rel_s2 = sorted(df[df.iloc[:, 1].isin(sel_p2)].iloc[:, 2].unique())
-                sel_s2 = st.multiselect("2. 절 선택 (리포트)", rel_s2, default=rel_s2, key="s_rep")
-                for p in sel_p2:
-                    with st.expander(f"📁 {p}", expanded=True):
-                        p_df = df[(df.iloc[:, 1] == p) & (df.iloc[:, 2].isin(sel_s2))]
-                        for s in sorted(p_df.iloc[:, 2].unique()):
-                            st.markdown(f"#### 📑 {s}")
-                            for _, r in p_df[p_df.iloc[:, 2] == s].iterrows():
-                                iss = r.iloc[5]
-                                if not st.session_state.his.empty:
-                                    mask = st.session_state.his['issue'].apply(lambda x: str(x) == iss or str(x).startswith(iss + "("))
-                                    recs = st.session_state.his[mask]
-                                    if not recs.empty:
-                                        st.write(f"**📌 {iss}**")
-                                        for _, row in recs.iloc[::-1].iterrows():
-                                            with st.container():
-                                                st.caption(f"📅 학습 일시: {row['date']}")
-                                                st.warning(f"**보완 사항**: {row['feedback']}")
-                                                r_low1, r_low2 = st.columns(2)
-                                                r_low1.info(f"**나의 답변**\n\n{row['my_answer']}")
-                                                r_low2.success(f"**실제 정답**\n\n{row['correct']}")
-                                                st.divider()
+        evaluation = st.radio("스스로 평가하기", ["쉬움", "보통", "어려움"], index=None, horizontal=True, key=f"evaluation_{current['_card_id']}")
+        feedback = st.text_input("보완할 점:", key=f"feedback_{current['_card_id']}")
+        if st.button("💾 기록 저장"):
+            record = {
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M"), "card_id": current["_card_id"],
+                "issue": current.iloc[5], "correct": current.iloc[6],
+                "my_answer": typed_answer if study_mode == "타이핑 모드" else "플래시카드",
+                "feedback": feedback, "evaluation": evaluation or "",
+            }
+            if append_history(record):
+                st.session_state.history = pd.concat([st.session_state.history, pd.DataFrame([record])], ignore_index=True)
+                st.success("✅ 저장 완료!")
 
-        # 전체 쟁점 정리
-        with t3:
-            st.header("📑 전체 쟁점 정리")
-            sel_p3 = st.multiselect("1. 편 선택 (정리)", all_parts, key="p_total")
-            if sel_p3:
-                rel_s3 = sorted(df[df.iloc[:, 1].isin(sel_p3)].iloc[:, 2].unique())
-                sel_s3 = st.multiselect("2. 절 선택 (정리)", rel_s3, default=rel_s3, key="s_total")
-                for p in sel_p3:
-                    with st.expander(f"📁 {p}", expanded=True):
-                        p_df = df[(df.iloc[:, 1] == p) & (df.iloc[:, 2].isin(sel_s3))]
-                        for s in sorted(p_df.iloc[:, 2].unique()):
-                            st.markdown(f"#### 📑 {s}")
-                            for _, r in p_df[p_df.iloc[:, 2] == s].iterrows():
-                                with st.expander(f"🔍 {r.iloc[5]}"):
-                                    st.caption(get_pin_text(r))
-                                    st.write(f"**내용:** {r.iloc[6]}")
+with t2:
+    st.header("📊 학습 리포트")
+    if st.button("🔄 리포트 새로고침"):
+        st.session_state.history = read_sheet("History", HISTORY_COLUMNS)
+        st.rerun()
+    report_parts = st.multiselect("1. 편 선택 (리포트)", parts, key="report_parts")
+    if report_parts:
+        sections = sorted(cards[cards.iloc[:, 1].isin(report_parts)].iloc[:, 2].unique())
+        report_sections = st.multiselect("2. 절 선택 (리포트)", sections, default=sections, key="report_sections")
+        shown = 0
+        for _, row in cards[(cards.iloc[:, 1].isin(report_parts)) & (cards.iloc[:, 2].isin(report_sections))].iterrows():
+            records = st.session_state.history
+            if "card_id" in records.columns:
+                has_card_id = records["card_id"].notna() & records["card_id"].astype(str).ne("")
+                records = records[
+                    (has_card_id & records["card_id"].astype(str).eq(str(row["_card_id"])))
+                    | (~has_card_id & records["issue"].astype(str).eq(str(row.iloc[5])))
+                ]
+            if records.empty:
+                continue
+            shown += 1
+            with st.expander(f"📌 {row.iloc[5]}", expanded=False):
+                for _, record in records.iloc[::-1].iterrows():
+                    st.caption(f"📅 학습 일시: {record.get('date', '')} · 평가: {record.get('evaluation', '') or '-'}")
+                    st.warning(f"**보완 사항**: {record.get('feedback', '') or '-'}")
+                    a, b = st.columns(2)
+                    a.info(f"**나의 답변**\n\n{record.get('my_answer', '')}")
+                    b.success(f"**실제 정답**\n\n{record.get('correct', '')}")
+        if not shown:
+            st.info("선택한 범위에 저장된 학습 기록이 없습니다.")
 
-        # 현재 체크 문제 (핀 작게 상단 유지)
-        with t4:
-            st.header("📌 현재 체크 문제")
-            c_df = df[df.iloc[:, 5].isin(st.session_state.chk)]
-            for _, r in c_df.iterrows():
-                st.markdown(f"<span style='font-size:15px; color:gray;'>{get_pin_text(r)}</span>", unsafe_allow_html=True)
-                st.markdown(f"<h4 style='margin-top: 5px;'>❓ {r.iloc[5]}</h4>", unsafe_allow_html=True)
-                st.write(f"**판례:** {r.iloc[6]}"); st.divider()
-                
-        with t5:
-            st.header("🕒 누적 체크 기록")
-            for is_nm, ct in st.session_state.evr.items():
-                with st.expander(f"🚩 {is_nm} ({ct}회)"):
-                    match_row = df[df.iloc[:, 5] == is_nm]
-                    if not match_row.empty: st.write(match_row.iloc[0, 6])
+with t3:
+    st.header("📑 전체 쟁점 정리")
+    total_parts = st.multiselect("1. 편 선택 (정리)", parts, key="total_parts")
+    if total_parts:
+        sections = sorted(cards[cards.iloc[:, 1].isin(total_parts)].iloc[:, 2].unique())
+        total_sections = st.multiselect("2. 절 선택 (정리)", sections, default=sections, key="total_sections")
+        for _, row in cards[(cards.iloc[:, 1].isin(total_parts)) & (cards.iloc[:, 2].isin(total_sections))].iterrows():
+            with st.expander(f"🔍 {row.iloc[5]}"):
+                st.caption(pin_text(row))
+                st.write(f"**내용:** {row.iloc[6]}")
 
-    except Exception as e: st.error(f"⚠️ 오류 발생: {e}")
-else: st.info("👈 사이드바에서 엑셀 파일을 업로드해 주세요!")
+with t4:
+    st.header("📌 현재 체크 문제")
+    checked_cards = cards[cards.apply(is_checked, axis=1)]
+    if checked_cards.empty:
+        st.info("체크한 문제가 없습니다.")
+    for _, row in checked_cards.iterrows():
+        st.caption(pin_text(row))
+        st.markdown(f"#### ❓ {row.iloc[5]}")
+        st.write(f"**판례:** {row.iloc[6]}")
+        st.divider()
+
+with t5:
+    st.header("🕒 누적 체크 기록")
+    if not st.session_state.ever_checked:
+        st.info("누적 체크 기록이 없습니다.")
+    for key, count in sorted(st.session_state.ever_checked.items(), key=lambda item: item[1], reverse=True):
+        matched = cards[cards["_card_id"].eq(key)]
+        title = matched.iloc[0, 5] if not matched.empty else key
+        with st.expander(f"🚩 {title} ({count}회)"):
+            if not matched.empty:
+                st.write(matched.iloc[0, 6])
+            else:
+                st.caption("현재 업로드한 파일에는 없는 과거 체크 기록입니다.")
